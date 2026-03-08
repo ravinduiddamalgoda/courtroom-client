@@ -16,6 +16,7 @@ import time
 import datetime
 import tempfile
 import pyaudio
+import numpy as np
 import requests
 from pathlib import Path
 
@@ -41,7 +42,8 @@ LCD_COLS      = int(os.environ.get("LCD_COLS", "16"))
 LCD_ROWS      = int(os.environ.get("LCD_ROWS", "2"))
 
 # Audio settings
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 16000        # target rate for the diarization API
+RECORD_RATE = 44100        # native rate recorded from hardware
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK = 1024
@@ -355,7 +357,7 @@ class AudioRecorder:
         self.stream = self.pa.open(
             format=FORMAT,
             channels=CHANNELS,
-            rate=SAMPLE_RATE,
+            rate=RECORD_RATE,
             input=True,
             frames_per_buffer=CHUNK,
             stream_callback=self._callback,
@@ -376,11 +378,19 @@ class AudioRecorder:
             self.stream = None
 
     def save(self, path):
+        samples = np.frombuffer(b"".join(self.frames), dtype=np.int16)
+        if RECORD_RATE != SAMPLE_RATE:
+            target_len = int(len(samples) * SAMPLE_RATE / RECORD_RATE)
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, target_len),
+                np.arange(len(samples)),
+                samples,
+            ).astype(np.int16)
         with wave.open(path, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.pa.get_sample_size(FORMAT))
             wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b"".join(self.frames))
+            wf.writeframes(samples.tobytes())
 
     def __del__(self):
         self.pa.terminate()
