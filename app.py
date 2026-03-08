@@ -12,6 +12,7 @@ import queue
 import wave
 import json
 import os
+import io
 import time
 import datetime
 import tempfile
@@ -378,19 +379,24 @@ class AudioRecorder:
             self.stream = None
 
     def save(self, path):
-        samples = np.frombuffer(b"".join(self.frames), dtype=np.int16)
-        if RECORD_RATE != SAMPLE_RATE:
-            target_len = int(len(samples) * SAMPLE_RATE / RECORD_RATE)
-            samples = np.interp(
-                np.linspace(0, len(samples) - 1, target_len),
-                np.arange(len(samples)),
-                samples,
-            ).astype(np.int16)
+        """Save at native RECORD_RATE for correct playback speed and quality."""
+        samples = np.frombuffer(b"".join(self.frames), dtype=np.int16).astype(np.float32)
+
+        # Pre-emphasis: boost high frequencies for speech clarity
+        samples[1:] -= 0.97 * samples[:-1]
+
+        # Noise gate: silence chunks whose RMS is below threshold
+        gate_threshold = 300.0
+        for i in range(0, len(samples) - CHUNK, CHUNK):
+            if np.sqrt(np.mean(samples[i:i + CHUNK] ** 2)) < gate_threshold:
+                samples[i:i + CHUNK] = 0.0
+
+        out = np.clip(samples, -32768, 32767).astype(np.int16)
         with wave.open(path, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.pa.get_sample_size(FORMAT))
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(samples.tobytes())
+            wf.setframerate(RECORD_RATE)   # native rate — playback sounds correct
+            wf.writeframes(out.tobytes())
 
     def __del__(self):
         self.pa.terminate()
@@ -444,19 +450,51 @@ class AudioPlayer:
 
 # ── API Client ───────────────────────────────────────────────────────────────
 
+def _resample_wav_to_bytes(audio_path, target_rate=SAMPLE_RATE):
+    """Read a WAV file and return in-memory bytes resampled to target_rate."""
+    with wave.open(audio_path, "rb") as wf:
+        src_rate = wf.getframerate()
+        src_channels = wf.getnchannels()
+        raw = wf.readframes(wf.getnframes())
+
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+
+    # Mix down to mono if stereo
+    if src_channels > 1:
+        samples = samples.reshape(-1, src_channels).mean(axis=1)
+
+    # Resample if needed
+    if src_rate != target_rate:
+        target_len = int(len(samples) * target_rate / src_rate)
+        samples = np.interp(
+            np.linspace(0, len(samples) - 1, target_len),
+            np.arange(len(samples)),
+            samples,
+        )
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(target_rate)
+        wf.writeframes(samples.astype(np.int16).tobytes())
+    buf.seek(0)
+    return buf
+
+
 def submit_audio(audio_path, on_progress=None):
     """Send audio file to diarization endpoint and return result JSON."""
     headers = {"X-API-Key": API_KEY}
-    with open(audio_path, "rb") as f:
-        files = {"audio": (os.path.basename(audio_path), f, "audio/wav")}
-        if on_progress:
-            on_progress("Uploading audio...")
-        resp = requests.post(
-            f"{API_URL}/diarize",
-            headers=headers,
-            files=files,
-            timeout=300,
-        )
+    if on_progress:
+        on_progress("Uploading audio...")
+    api_buf = _resample_wav_to_bytes(audio_path, target_rate=SAMPLE_RATE)
+    files = {"audio": (os.path.basename(audio_path), api_buf, "audio/wav")}
+    resp = requests.post(
+        f"{API_URL}/diarize",
+        headers=headers,
+        files=files,
+        timeout=300,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -977,7 +1015,6 @@ class CourtroomApp(tk.Tk):
                         relief="flat", bd=0, highlightbackground="#dde3ea", highlightthickness=1)
         card.pack(fill="x", padx=15, pady=6)
 
-        # Left color bar
         tk.Frame(card, bg=color, width=5).pack(side="left", fill="y")
 
         content = tk.Frame(card, bg="white")
@@ -990,35 +1027,56 @@ class CourtroomApp(tk.Tk):
                  bg="white", fg=color).pack(side="left")
         tk.Label(header, text=f"  [{start:.1f}s – {end:.1f}s]",
                  font=("Helvetica", 9), bg="white", fg="#888").pack(side="left")
-
-        # Badges (right-aligned)
         badges = tk.Frame(header, bg="white")
         badges.pack(side="right")
         tk.Label(badges, text=f" {total_words}w ",
                  font=("Helvetica", 8), bg="#546e7a", fg="white", padx=3, pady=1).pack(side="left", padx=2)
         if corrected_words > 0:
-            tk.Label(badges, text=f" ✎ {corrected_words} fixed ",
+            tk.Label(badges, text=f" ✎ {corrected_words} corrected ",
                      font=("Helvetica", 8), bg="#1565c0", fg="white", padx=3, pady=1).pack(side="left", padx=2)
-        tk.Label(badges, text=f" {accuracy:.0f}% ",
-                 font=("Helvetica", 8, "bold"), bg=acc_color, fg="white", padx=3, pady=1).pack(side="left", padx=2)
+        tk.Label(badges, text=f" AI accuracy: {accuracy:.0f}% ",
+                 font=("Helvetica", 8, "bold"), bg=acc_color, fg="white", padx=4, pady=1).pack(side="left", padx=2)
 
-        ttk.Separator(content, orient="horizontal").pack(fill="x", pady=(6, 4))
+        ttk.Separator(content, orient="horizontal").pack(fill="x", pady=(6, 5))
 
-        # ── AI word-level analysis ──
+        # ── Raw ASR row ──
+        tk.Label(content, text="📝 Raw ASR:", font=("Helvetica", 9, "bold"),
+                 bg="white", fg="#616161").pack(anchor="w")
+        asr_box = tk.Text(content, height=2, font=("Helvetica", 10),
+                          bg="#fafafa", relief="flat", wrap="word",
+                          highlightbackground="#e0e0e0", highlightthickness=1,
+                          padx=6, pady=4, fg="#424242", cursor="arrow")
+        asr_box.insert("1.0", asr_text)
+        asr_box.config(state="disabled")
+        asr_box.pack(fill="x", pady=(2, 8))
+
+        # ── AI Optimized row with per-word probabilities ──
         ai_hdr = tk.Frame(content, bg="white")
         ai_hdr.pack(fill="x", pady=(0, 2))
-        tk.Label(ai_hdr, text="🤖 AI Optimized", font=("Helvetica", 9, "bold"),
-                 bg="white", fg="#1565c0").pack(side="left")
+        tk.Label(ai_hdr, text=f"🤖 AI Optimized  (accuracy: {accuracy:.1f}%",
+                 font=("Helvetica", 9, "bold"), bg="white", fg="#1565c0").pack(side="left")
+        tk.Label(ai_hdr, text=f"  |  {total_words} words",
+                 font=("Helvetica", 9), bg="white", fg="#888").pack(side="left")
+        if corrected_words > 0:
+            tk.Label(ai_hdr, text=f"  |  ✎ {corrected_words} AI-corrected)",
+                     font=("Helvetica", 9), bg="white", fg="#1565c0").pack(side="left")
+        else:
+            tk.Label(ai_hdr, text=")", font=("Helvetica", 9), bg="white", fg="#888").pack(side="left")
 
         word_text = tk.Text(content, height=3, font=("Helvetica", 11),
                             bg="#f0f7ff", relief="flat", wrap="word",
                             highlightbackground="#90caf9", highlightthickness=1,
                             padx=6, pady=5, cursor="arrow")
         word_text.tag_configure("high",    foreground="#212121")
+        word_text.tag_configure("high_p",  foreground="#9e9e9e", font=("Helvetica", 7))
         word_text.tag_configure("med",     foreground="#e67e00")
+        word_text.tag_configure("med_p",   foreground="#e67e00", font=("Helvetica", 7))
         word_text.tag_configure("low",     foreground="#bf360c")
+        word_text.tag_configure("low_p",   foreground="#bf360c", font=("Helvetica", 7))
         word_text.tag_configure("garbled", foreground="#c62828", underline=True)
+        word_text.tag_configure("garb_p",  foreground="#c62828", font=("Helvetica", 7))
         word_text.tag_configure("fixed",   foreground="#0d47a1", background="#e3f2fd")
+        word_text.tag_configure("fixed_p", foreground="#1565c0", font=("Helvetica", 7))
 
         if word_scores:
             for i, ws in enumerate(word_scores):
@@ -1032,30 +1090,26 @@ class CourtroomApp(tk.Tk):
                     word_text.insert("end", " ")
 
                 if was_corrected:
+                    pct = f"{prob * 100:.2f}%" if prob < 0.05 else f"{prob * 100:.0f}%"
                     word_text.insert("end", f"[{orig}→{word}]", "fixed")
-                elif not meaningful:
+                    word_text.insert("end", f"({pct})", "fixed_p")
+                elif not meaningful or prob < 0.0001:
                     word_text.insert("end", word, "garbled")
+                    word_text.insert("end", f"({prob * 100:.4f}%)", "garb_p")
                 elif prob >= 0.05:
                     word_text.insert("end", word, "high")
+                    word_text.insert("end", f"({prob * 100:.0f}%)", "high_p")
                 elif prob >= 0.001:
                     word_text.insert("end", word, "med")
-                elif prob >= 0.0001:
-                    word_text.insert("end", word, "low")
+                    word_text.insert("end", f"({prob * 100:.2f}%)", "med_p")
                 else:
-                    word_text.insert("end", word, "garbled")
+                    word_text.insert("end", word, "low")
+                    word_text.insert("end", f"({prob * 100:.3f}%)", "low_p")
         else:
             word_text.insert("end", ai_text or asr_text)
 
         word_text.config(state="disabled")
         word_text.pack(fill="x", pady=(0, 6))
-
-        # ── Raw ASR ──
-        asr_row = tk.Frame(content, bg="white")
-        asr_row.pack(fill="x", pady=(0, 4))
-        tk.Label(asr_row, text="ASR: ", font=("Helvetica", 9, "bold"),
-                 bg="white", fg="#9e9e9e").pack(side="left")
-        tk.Label(asr_row, text=asr_text, font=("Helvetica", 9),
-                 bg="white", fg="#bdbdbd", wraplength=640, justify="left").pack(side="left", anchor="w")
 
         # ── Editable correction ──
         tk.Label(content, text="✏ Edit / Correct:", font=("Helvetica", 9, "bold"),
