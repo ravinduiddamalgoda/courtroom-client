@@ -448,7 +448,7 @@ def submit_audio(audio_path, on_progress=None):
     """Send audio file to diarization endpoint and return result JSON."""
     headers = {"X-API-Key": API_KEY}
     with open(audio_path, "rb") as f:
-        files = {"audio": (os.path.basename(audio_path), f, "audio/wav")}
+        files = {"file": (os.path.basename(audio_path), f, "audio/wav")}
         if on_progress:
             on_progress("Uploading audio...")
         resp = requests.post(
@@ -922,9 +922,34 @@ class CourtroomApp(tk.Tk):
         n_seg = result.get("total_segments", 0)
         acc = result.get("overall_accuracy_pct", 0)
         dur = result.get("audio_duration_s", 0)
+        total_w = result.get("total_words", 0)
+        corr_w = result.get("total_corrected_words", 0)
+        diar_ms = result.get("diarization_time_ms", 0)
+        asr_ms = result.get("transcription_time_ms", 0)
+        llm_ms = result.get("ai_optimization_time_ms", 0)
         self.stats_label.config(
-            text=f"Speakers: {n_spk}  |  Segments: {n_seg}  |  Accuracy: {acc:.1f}%  |  Duration: {dur:.1f}s"
+            text=(
+                f"Speakers: {n_spk}  |  Segments: {n_seg}  |  "
+                f"Accuracy: {acc:.1f}%  |  Duration: {dur:.1f}s  |  "
+                f"Words: {total_w}  |  AI corrections: {corr_w}  |  "
+                f"⏱ diar {diar_ms/1000:.1f}s  asr {asr_ms/1000:.1f}s  llm {llm_ms/1000:.1f}s"
+            )
         )
+
+        # Legend
+        legend = tk.Frame(self.segments_frame, bg="#f0f4f8", pady=4)
+        legend.pack(fill="x", padx=15, pady=(4, 2))
+        tk.Label(legend, text="Word confidence:", font=("Helvetica", 8, "bold"),
+                 bg="#f0f4f8", fg="#555").pack(side="left", padx=(4, 6))
+        for dot, desc in (
+            ("#212121", "High"),
+            ("#e67e00", "Medium"),
+            ("#bf360c", "Low"),
+            ("#c62828", "Garbled"),
+            ("#0d47a1", "AI-corrected [orig→new]"),
+        ):
+            tk.Label(legend, text="■", font=("Helvetica", 10), bg="#f0f4f8", fg=dot).pack(side="left")
+            tk.Label(legend, text=f" {desc}  ", font=("Helvetica", 8), bg="#f0f4f8", fg="#555").pack(side="left")
 
         segments = result.get("segments", [])
         edited = self.session.edited_segments if self.session else []
@@ -941,37 +966,106 @@ class CourtroomApp(tk.Tk):
         accuracy = seg.get("segment_accuracy_pct", 0)
         asr_text = seg.get("asr_text", "")
         ai_text = seg.get("ai_corrected_text", "")
+        word_scores = seg.get("word_scores", [])
+        total_words = seg.get("total_words", 0)
+        corrected_words = seg.get("corrected_words", 0)
         current_text = edited_text or ai_text or asr_text
 
-        card = tk.Frame(self.segments_frame, bg="white", pady=8, padx=12,
-                        relief="flat", bd=0, highlightbackground="#dde3ea", highlightthickness=1)
-        card.pack(fill="x", padx=15, pady=5)
+        acc_color = "#0d8a3c" if accuracy >= 90 else ("#e67e00" if accuracy >= 70 else "#c62828")
 
-        # Color bar
-        bar = tk.Frame(card, bg=color, width=4)
-        bar.pack(side="left", fill="y")
+        card = tk.Frame(self.segments_frame, bg="white", pady=0, padx=0,
+                        relief="flat", bd=0, highlightbackground="#dde3ea", highlightthickness=1)
+        card.pack(fill="x", padx=15, pady=6)
+
+        # Left color bar
+        tk.Frame(card, bg=color, width=5).pack(side="left", fill="y")
 
         content = tk.Frame(card, bg="white")
-        content.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        content.pack(side="left", fill="both", expand=True, padx=12, pady=8)
 
-        # Header row
+        # ── Header ──
         header = tk.Frame(content, bg="white")
         header.pack(fill="x")
         tk.Label(header, text=label, font=("Helvetica", 11, "bold"),
                  bg="white", fg=color).pack(side="left")
-        tk.Label(header, text=f"  [{start:.1f}s – {end:.1f}s]  accuracy: {accuracy:.1f}%",
+        tk.Label(header, text=f"  [{start:.1f}s – {end:.1f}s]",
                  font=("Helvetica", 9), bg="white", fg="#888").pack(side="left")
 
-        # Original ASR (collapsed, small)
-        tk.Label(content, text=f"ASR: {asr_text}", font=("Helvetica", 9),
-                 bg="white", fg="#aaa", wraplength=700, justify="left").pack(anchor="w")
+        # Badges (right-aligned)
+        badges = tk.Frame(header, bg="white")
+        badges.pack(side="right")
+        tk.Label(badges, text=f" {total_words}w ",
+                 font=("Helvetica", 8), bg="#546e7a", fg="white", padx=3, pady=1).pack(side="left", padx=2)
+        if corrected_words > 0:
+            tk.Label(badges, text=f" ✎ {corrected_words} fixed ",
+                     font=("Helvetica", 8), bg="#1565c0", fg="white", padx=3, pady=1).pack(side="left", padx=2)
+        tk.Label(badges, text=f" {accuracy:.0f}% ",
+                 font=("Helvetica", 8, "bold"), bg=acc_color, fg="white", padx=3, pady=1).pack(side="left", padx=2)
 
-        # Editable text area
-        text_widget = tk.Text(content, height=3, font=("Helvetica", 11),
-                              bg="#f9f9f9", relief="flat", wrap="word",
-                              highlightbackground="#dde3ea", highlightthickness=1)
+        ttk.Separator(content, orient="horizontal").pack(fill="x", pady=(6, 4))
+
+        # ── AI word-level analysis ──
+        ai_hdr = tk.Frame(content, bg="white")
+        ai_hdr.pack(fill="x", pady=(0, 2))
+        tk.Label(ai_hdr, text="🤖 AI Optimized", font=("Helvetica", 9, "bold"),
+                 bg="white", fg="#1565c0").pack(side="left")
+
+        word_text = tk.Text(content, height=3, font=("Helvetica", 11),
+                            bg="#f0f7ff", relief="flat", wrap="word",
+                            highlightbackground="#90caf9", highlightthickness=1,
+                            padx=6, pady=5, cursor="arrow")
+        word_text.tag_configure("high",    foreground="#212121")
+        word_text.tag_configure("med",     foreground="#e67e00")
+        word_text.tag_configure("low",     foreground="#bf360c")
+        word_text.tag_configure("garbled", foreground="#c62828", underline=True)
+        word_text.tag_configure("fixed",   foreground="#0d47a1", background="#e3f2fd")
+
+        if word_scores:
+            for i, ws in enumerate(word_scores):
+                word = ws.get("word", "")
+                orig = ws.get("original_word", word)
+                prob = ws.get("probability", 1.0)
+                meaningful = ws.get("is_meaningful", True)
+                was_corrected = ws.get("was_corrected", False)
+
+                if i > 0:
+                    word_text.insert("end", " ")
+
+                if was_corrected:
+                    word_text.insert("end", f"[{orig}→{word}]", "fixed")
+                elif not meaningful:
+                    word_text.insert("end", word, "garbled")
+                elif prob >= 0.05:
+                    word_text.insert("end", word, "high")
+                elif prob >= 0.001:
+                    word_text.insert("end", word, "med")
+                elif prob >= 0.0001:
+                    word_text.insert("end", word, "low")
+                else:
+                    word_text.insert("end", word, "garbled")
+        else:
+            word_text.insert("end", ai_text or asr_text)
+
+        word_text.config(state="disabled")
+        word_text.pack(fill="x", pady=(0, 6))
+
+        # ── Raw ASR ──
+        asr_row = tk.Frame(content, bg="white")
+        asr_row.pack(fill="x", pady=(0, 4))
+        tk.Label(asr_row, text="ASR: ", font=("Helvetica", 9, "bold"),
+                 bg="white", fg="#9e9e9e").pack(side="left")
+        tk.Label(asr_row, text=asr_text, font=("Helvetica", 9),
+                 bg="white", fg="#bdbdbd", wraplength=640, justify="left").pack(side="left", anchor="w")
+
+        # ── Editable correction ──
+        tk.Label(content, text="✏ Edit / Correct:", font=("Helvetica", 9, "bold"),
+                 bg="white", fg="#555").pack(anchor="w")
+        text_widget = tk.Text(content, height=2, font=("Helvetica", 11),
+                              bg="#fffde7", relief="flat", wrap="word",
+                              highlightbackground="#f9a825", highlightthickness=1,
+                              padx=6, pady=4)
         text_widget.insert("1.0", current_text)
-        text_widget.pack(fill="x", pady=(4, 0))
+        text_widget.pack(fill="x", pady=(2, 0))
         self.segment_editors.append(text_widget)
 
     # ── Edit & Save ───────────────────────────────────────────────────────────
