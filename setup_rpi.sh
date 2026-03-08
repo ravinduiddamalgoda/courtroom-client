@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # SinLlama Courtroom Client — Raspberry Pi Setup Script
-# Tested on Raspberry Pi OS (Bookworm / Bullseye) 64-bit
+# Tested on Raspberry Pi OS (Bookworm / Bullseye / Trixie) 64-bit
 # ============================================================
 set -e
 
@@ -10,7 +10,7 @@ sudo apt-get update -y
 sudo apt-get install -y \
     python3 python3-venv python3-pip \
     portaudio19-dev python3-pyaudio \
-    libatlas-base-dev \
+    libopenblas-dev \
     i2c-tools \
     fonts-noto \
     git
