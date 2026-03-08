@@ -448,7 +448,7 @@ def submit_audio(audio_path, on_progress=None):
     """Send audio file to diarization endpoint and return result JSON."""
     headers = {"X-API-Key": API_KEY}
     with open(audio_path, "rb") as f:
-        files = {"file": (os.path.basename(audio_path), f, "audio/wav")}
+        files = {"audio": (os.path.basename(audio_path), f, "audio/wav")}
         if on_progress:
             on_progress("Uploading audio...")
         resp = requests.post(
