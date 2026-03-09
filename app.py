@@ -43,8 +43,8 @@ LCD_COLS      = int(os.environ.get("LCD_COLS", "16"))
 LCD_ROWS      = int(os.environ.get("LCD_ROWS", "2"))
 
 # Audio settings
-SAMPLE_RATE = 16000        # target rate for the diarization API
-RECORD_RATE = 44100        # native rate recorded from hardware
+SAMPLE_RATE = 16000                                               # target rate for the diarization API
+RECORD_RATE = int(os.environ.get("RECORD_SAMPLE_RATE", "44100"))  # native mic rate (common: 44100, 48000)
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK = 1024
