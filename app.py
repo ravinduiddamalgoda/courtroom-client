@@ -16,7 +16,8 @@ import io
 import time
 import datetime
 import tempfile
-import pyaudio
+import signal
+import subprocess
 import numpy as np
 import requests
 from pathlib import Path
@@ -46,17 +47,13 @@ LCD_COLS      = int(os.environ.get("LCD_COLS", "16"))
 LCD_ROWS      = int(os.environ.get("LCD_ROWS", "2"))
 
 # Audio settings
-SAMPLE_RATE = 16000                                               # target rate for the diarization API
-RECORD_RATE = int(os.environ.get("RECORD_SAMPLE_RATE", "44100"))  # native mic rate (common: 44100, 48000)
-CHANNELS = 1
-FORMAT = pyaudio.paInt16
+SAMPLE_RATE = 16000  # target rate for the diarization API
 CHUNK = 1024
 
-# Audio device selection (run with list_audio_devices() to find indices)
-_idev = os.environ.get("INPUT_DEVICE_INDEX")
-_odev = os.environ.get("OUTPUT_DEVICE_INDEX")
-INPUT_DEVICE_INDEX  = int(_idev) if _idev is not None else None
-OUTPUT_DEVICE_INDEX = int(_odev) if _odev is not None else None
+# ALSA device strings for arecord / aplay
+# Override via ALSA_INPUT_DEVICE / ALSA_OUTPUT_DEVICE in .env
+ALSA_INPUT_DEVICE  = os.environ.get("ALSA_INPUT_DEVICE",  "plughw:3,0")
+ALSA_OUTPUT_DEVICE = os.environ.get("ALSA_OUTPUT_DEVICE", "plughw:2,0")
 
 # Speaker colors for UI
 SPEAKER_COLORS = {
@@ -354,57 +351,52 @@ class Session:
 
 class AudioRecorder:
     def __init__(self):
-        self.pa = pyaudio.PyAudio()
-        self.stream = None
-        self.frames = []
+        self.proc = None
         self.recording = False
         self.duration = 0.0
+        self.output_path = None
+        self.start_time = None
 
-    def start(self):
-        self.frames = []
-        self.recording = True
+    def start(self, path):
+        self.output_path = path
         self.start_time = time.time()
-        self.stream = self.pa.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RECORD_RATE,
-            input=True,
-            input_device_index=INPUT_DEVICE_INDEX,
-            frames_per_buffer=CHUNK,
-            stream_callback=self._callback,
+        self.recording = True
+        cmd = [
+            "arecord",
+            "-D", ALSA_INPUT_DEVICE,
+            "-f", "S16_LE",
+            "-r", str(SAMPLE_RATE),
+            "-c", "1",
+            self.output_path,
+        ]
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
         )
-        self.stream.start_stream()
-
-    def _callback(self, in_data, frame_count, time_info, status):
-        if self.recording:
-            self.frames.append(in_data)
-        return (None, pyaudio.paContinue)
 
     def stop(self):
-        self.recording = False
-        self.duration = time.time() - self.start_time
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
+        if self.proc and self.recording:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+                self.proc.wait(timeout=5)
+            except Exception as e:
+                print(f"Recorder stop error: {e}")
+            self.duration = time.time() - self.start_time
+            self.recording = False
+            self.proc = None
 
-    def save(self, path):
-        """Save raw audio at native RECORD_RATE — no processing applied."""
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(self.pa.get_sample_size(FORMAT))
-            wf.setframerate(RECORD_RATE)
-            wf.writeframes(b"".join(self.frames))
-
-    def __del__(self):
-        self.pa.terminate()
+    def save(self):
+        # arecord already wrote directly to output_path
+        pass
 
 
 # ── Audio Player ─────────────────────────────────────────────────────────────
 
 class AudioPlayer:
     def __init__(self):
-        self.pa = pyaudio.PyAudio()
+        self.proc = None
         self._thread = None
         self.playing = False
 
@@ -412,39 +404,35 @@ class AudioPlayer:
         if self.playing:
             self.stop()
         self.playing = True
-        self._thread = threading.Thread(target=self._play_thread, args=(path, on_done), daemon=True)
+        self._thread = threading.Thread(
+            target=self._play_thread, args=(path, on_done), daemon=True
+        )
         self._thread.start()
 
     def _play_thread(self, path, on_done):
         try:
-            with wave.open(path, "rb") as wf:
-                stream = self.pa.open(
-                    format=self.pa.get_format_from_width(wf.getsampwidth()),
-                    channels=wf.getnchannels(),
-                    rate=wf.getframerate(),
-                    output=True,
-                    output_device_index=OUTPUT_DEVICE_INDEX,
-                )
-                data = wf.readframes(CHUNK)
-                while data and self.playing:
-                    stream.write(data)
-                    data = wf.readframes(CHUNK)
-                stream.stop_stream()
-                stream.close()
+            self.proc = subprocess.Popen(
+                ["aplay", "-D", ALSA_OUTPUT_DEVICE, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+            self.proc.wait()
         except Exception as e:
             print(f"Playback error: {e}")
         finally:
             self.playing = False
+            self.proc = None
             if on_done:
                 on_done()
 
     def stop(self):
+        if self.proc and self.playing:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
         self.playing = False
-        if self._thread:
-            self._thread.join(timeout=1)
-
-    def __del__(self):
-        self.pa.terminate()
 
 
 # ── API Client ───────────────────────────────────────────────────────────────
@@ -826,7 +814,9 @@ class CourtroomApp(tk.Tk):
                 judge_name=self._info_vars["judge_name"].get(),
                 court_name=self._info_vars["court_name"].get(),
             )
-        self.recorder.start()
+        audio_path = str(SESSIONS_DIR / f"{self.session.session_id}.wav")
+        self.session.audio_file = audio_path
+        self.recorder.start(audio_path)
         self._start_timer()
         self.btn_record.config(text="⏹ Stop Recording", bg="#b71c1c")
         self.rec_indicator.config(text="● RECORDING")
@@ -844,14 +834,11 @@ class CourtroomApp(tk.Tk):
         self.btn_record.config(text="🎙 Start Recording", bg="#e84e1a")
         self.rec_indicator.config(text="")
 
-        audio_path = str(SESSIONS_DIR / f"{self.session.session_id}.wav")
-        self.recorder.save(audio_path)
-        self.session.audio_file = audio_path
         self.session.save()
 
         self.btn_play.config(state="normal")
         self.btn_submit.config(state="normal")
-        self._set_status(f"Recording saved: {audio_path}  ({self.recorder.duration:.1f}s)")
+        self._set_status(f"Recording saved: {self.session.audio_file}  ({self.recorder.duration:.1f}s)")
         self.lcd.show_saved(self.recorder.duration)
 
     # ── Playback ──────────────────────────────────────────────────────────────
@@ -1241,20 +1228,13 @@ class CourtroomApp(tk.Tk):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def list_audio_devices():
-    pa = pyaudio.PyAudio()
-    print("\n=== PyAudio Devices ===")
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        print(
-            f"  [{i}] {info['name']}"
-            f"  in={info['maxInputChannels']}"
-            f"  out={info['maxOutputChannels']}"
-            f"  rate={int(info['defaultSampleRate'])}Hz"
-        )
-    print(f"\n  Active INPUT_DEVICE_INDEX  = {INPUT_DEVICE_INDEX}")
-    print(f"  Active OUTPUT_DEVICE_INDEX = {OUTPUT_DEVICE_INDEX}")
-    print("========================\n")
-    pa.terminate()
+    print("\n=== ALSA Devices (arecord -l) ===")
+    subprocess.run(["arecord", "-l"], check=False)
+    print("\n=== ALSA Devices (aplay -l) ===")
+    subprocess.run(["aplay", "-l"], check=False)
+    print(f"\n  Active ALSA_INPUT_DEVICE  = {ALSA_INPUT_DEVICE}")
+    print(f"  Active ALSA_OUTPUT_DEVICE = {ALSA_OUTPUT_DEVICE}")
+    print("=================================\n")
 
 
 if __name__ == "__main__":
