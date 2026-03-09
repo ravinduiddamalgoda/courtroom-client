@@ -20,6 +20,9 @@ import pyaudio
 import numpy as np
 import requests
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # PDF export
 from reportlab.lib.pagesizes import A4
