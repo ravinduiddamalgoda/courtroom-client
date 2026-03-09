@@ -1255,6 +1255,9 @@ def list_audio_devices():
 
 
 if __name__ == "__main__":
-    list_audio_devices()
+    import sys
+    if "--list-devices" in sys.argv:
+        list_audio_devices()
+        sys.exit(0)
     app = CourtroomApp()
     app.mainloop()
