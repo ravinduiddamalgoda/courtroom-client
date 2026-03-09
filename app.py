@@ -49,6 +49,12 @@ CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK = 1024
 
+# Audio device selection (run with list_audio_devices() to find indices)
+_idev = os.environ.get("INPUT_DEVICE_INDEX")
+_odev = os.environ.get("OUTPUT_DEVICE_INDEX")
+INPUT_DEVICE_INDEX  = int(_idev) if _idev is not None else None
+OUTPUT_DEVICE_INDEX = int(_odev) if _odev is not None else None
+
 # Speaker colors for UI
 SPEAKER_COLORS = {
     "SPEAKER_00": "#1a73e8",
@@ -360,6 +366,7 @@ class AudioRecorder:
             channels=CHANNELS,
             rate=RECORD_RATE,
             input=True,
+            input_device_index=INPUT_DEVICE_INDEX,
             frames_per_buffer=CHUNK,
             stream_callback=self._callback,
         )
@@ -379,24 +386,12 @@ class AudioRecorder:
             self.stream = None
 
     def save(self, path):
-        """Save at native RECORD_RATE for correct playback speed and quality."""
-        samples = np.frombuffer(b"".join(self.frames), dtype=np.int16).astype(np.float32)
-
-        # Pre-emphasis: boost high frequencies for speech clarity
-        samples[1:] -= 0.97 * samples[:-1]
-
-        # Noise gate: silence chunks whose RMS is below threshold
-        gate_threshold = 300.0
-        for i in range(0, len(samples) - CHUNK, CHUNK):
-            if np.sqrt(np.mean(samples[i:i + CHUNK] ** 2)) < gate_threshold:
-                samples[i:i + CHUNK] = 0.0
-
-        out = np.clip(samples, -32768, 32767).astype(np.int16)
+        """Save raw audio at native RECORD_RATE — no processing applied."""
         with wave.open(path, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.pa.get_sample_size(FORMAT))
-            wf.setframerate(RECORD_RATE)   # native rate — playback sounds correct
-            wf.writeframes(out.tobytes())
+            wf.setframerate(RECORD_RATE)
+            wf.writeframes(b"".join(self.frames))
 
     def __del__(self):
         self.pa.terminate()
@@ -425,6 +420,7 @@ class AudioPlayer:
                     channels=wf.getnchannels(),
                     rate=wf.getframerate(),
                     output=True,
+                    output_device_index=OUTPUT_DEVICE_INDEX,
                 )
                 data = wf.readframes(CHUNK)
                 while data and self.playing:
@@ -1241,6 +1237,24 @@ class CourtroomApp(tk.Tk):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def list_audio_devices():
+    pa = pyaudio.PyAudio()
+    print("\n=== PyAudio Devices ===")
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        print(
+            f"  [{i}] {info['name']}"
+            f"  in={info['maxInputChannels']}"
+            f"  out={info['maxOutputChannels']}"
+            f"  rate={int(info['defaultSampleRate'])}Hz"
+        )
+    print(f"\n  Active INPUT_DEVICE_INDEX  = {INPUT_DEVICE_INDEX}")
+    print(f"  Active OUTPUT_DEVICE_INDEX = {OUTPUT_DEVICE_INDEX}")
+    print("========================\n")
+    pa.terminate()
+
+
 if __name__ == "__main__":
+    list_audio_devices()
     app = CourtroomApp()
     app.mainloop()
